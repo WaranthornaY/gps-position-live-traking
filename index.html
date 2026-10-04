@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0f2a2e">
+<title>Waypal</title>
+<style>
+:root{--bg:#eef3f2;--ink:#0f2a2e;--mute:#5d7378;--line:#d3dedc;--card:#fff;--acc:#e8452c;--ok:#1d7a5a}
+@media(prefers-color-scheme:dark){:root{--bg:#0c1c1f;--ink:#e6efee;--mute:#8fa5a9;--line:#23393d;--card:#13282c}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;padding-top:env(safe-area-inset-top)}
+main{max-width:560px;margin:0 auto;padding:16px 16px calc(90px + env(safe-area-inset-bottom))}
+h1{font-size:1.5rem;margin:8px 0 16px;letter-spacing:-.01em}
+h2{font-size:1rem;margin:24px 0 8px;color:var(--mute);font-weight:600}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin-bottom:10px}
+button,select,input{font:inherit;color:inherit}
+button{border:1px solid var(--line);background:var(--card);border-radius:10px;padding:10px 14px;cursor:pointer}
+button.pri{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+button:focus-visible,select:focus-visible,input:focus-visible{outline:3px solid var(--acc);outline-offset:2px}
+select,input{border:1px solid var(--line);background:var(--card);border-radius:10px;padding:10px;width:100%}
+.row{display:flex;gap:8px;align-items:center}.row>*{flex:1}.row>.fit{flex:none}
+.rec{width:168px;height:168px;border-radius:50%;margin:12px auto;display:grid;place-items:center;font-weight:700;font-size:1.15rem;background:var(--acc);color:#fff;border:0;box-shadow:0 0 0 10px color-mix(in srgb,var(--acc) 18%,transparent)}
+.rec.on{border-radius:28px;background:var(--ink);color:var(--bg);box-shadow:0 0 0 10px color-mix(in srgb,var(--ink) 15%,transparent)}
+.center{text-align:center}.mute{color:var(--mute);font-size:.9rem}
+.id{font-size:2rem;font-weight:700;letter-spacing:.04em;text-align:center;margin:4px 0}
+.qr{width:220px;margin:8px auto;background:#fff;padding:10px;border-radius:10px}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--mute);margin-right:6px}.dot.on{background:var(--ok)}
+nav{position:fixed;left:0;right:0;bottom:0;display:flex;background:var(--card);border-top:1px solid var(--line);padding-bottom:env(safe-area-inset-bottom)}
+nav button{flex:1;border:0;border-radius:0;padding:16px 0;background:none;color:var(--mute);font-weight:600}
+nav button[aria-current=page]{color:var(--ink);box-shadow:inset 0 3px 0 var(--acc)}
+.ov{position:fixed;inset:0;background:var(--bg);z-index:9;padding:24px;display:grid;align-content:center;gap:12px}
+.ov[hidden]{display:none}
+video{width:100%;max-height:60vh;border-radius:14px;background:#000}
+#toast{position:fixed;left:16px;right:16px;bottom:calc(80px + env(safe-area-inset-bottom));background:var(--ink);color:var(--bg);padding:12px 14px;border-radius:10px;opacity:0;pointer-events:none;transition:opacity .2s;z-index:20;text-align:center}
+#toast.show{opacity:1}
+@media(prefers-reduced-motion:reduce){#toast{transition:none}}
+</style>
+</head>
+<body>
+<main id="app"></main>
+<nav>
+  <button data-v="home">Home</button>
+  <button data-v="loc">Location</button>
+  <button data-v="acct">Account</button>
+</nav>
+<div class="ov" id="setup" hidden>
+  <h1>Welcome to Waypal</h1>
+  <p class="mute">This device gets its own ID. No sign-up needed. Choose the country for your ID.</p>
+  <select id="setupCountry" aria-label="Country"></select>
+  <button class="pri" onclick="finishSetup()">Create my ID</button>
+</div>
+<div class="ov" id="scan" hidden>
+  <video id="vid" playsinline muted></video>
+  <p class="mute center">Point the camera at your friend's QR code.</p>
+  <button onclick="closeScan()">Cancel</button>
+</div>
+<div id="toast" role="status"></div>
+
+<script src="config.js"></script>
+<script src="lib/qrcode.js"></script>
+<script src="lib/jsQR.js"></script>
+<script>
+const $=s=>document.querySelector(s);
+const ls={get:(k,d)=>{try{const v=JSON.parse(localStorage.getItem(k));return v??d}catch{return d}},set:(k,v)=>localStorage.setItem(k,JSON.stringify(v))};
+const native=!!(window.Capacitor&&Capacitor.isNativePlatform&&Capacitor.isNativePlatform());
+const BG=native?Capacitor.Plugins.BackgroundGeolocation:null;
+const INTERVAL=5*60*1000;
+let acct=ls.get('acct',null),tracks=ls.get('tracks',[]),recState=ls.get('rec',null),friends=ls.get('friends',[]),shareOn=ls.get('share',false);
+let view='home',watcher=null,timer=null,lastPush=0,wid=null,stream=null,scanning=false,poller=null;
+
+/* ---------- helpers ---------- */
+function toast(m){const t=$('#toast');t.textContent=m;t.classList.add('show');clearTimeout(toast.h);toast.h=setTimeout(()=>t.classList.remove('show'),3200)}
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const fmt=t=>new Date(t).toLocaleString([], {dateStyle:'medium',timeStyle:'short'});
+const ago=t=>{const m=Math.round((Date.now()-new Date(t))/60000);return m<1?'just now':m<60?m+' min ago':m<1440?Math.round(m/60)+' h ago':Math.round(m/1440)+' d ago'};
+const configured=()=>/^https?:/.test(CFG.url);
+async function rpc(fn,args){
+  const r=await fetch(CFG.url+'/rest/v1/rpc/'+fn,{method:'POST',headers:{apikey:CFG.key,Authorization:'Bearer '+CFG.key,'Content-Type':'application/json'},body:JSON.stringify(args)});
+  const j=await r.json().catch(()=>null);
+  if(!r.ok)throw new Error((j&&j.message)||'Request failed ('+r.status+')');
+  return j;
+}
+const A=()=>({p_id:acct.id,p_secret:acct.secret});
+
+/* ---------- countries ---------- */
+const dn=new Intl.DisplayNames(['en'],{type:'region'});
+const COUNTRIES=[];
+for(const a of 'ABCDEFGHIJKLMNOPQRSTUVWXYZ')for(const b of 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'){const c=a+b;let n;try{n=dn.of(c)}catch{continue}if(n&&n!==c)COUNTRIES.push([c,n])}
+COUNTRIES.sort((x,y)=>x[1].localeCompare(y[1]));
+const opts=sel=>COUNTRIES.map(([c,n])=>`<option value="${c}"${c===sel?' selected':''}>${esc(n)} (${c})</option>`).join('');
+
+/* ---------- device account ---------- */
+const rand6=()=>String(crypto.getRandomValues(new Uint32Array(1))[0]%1000000).padStart(6,'0');
+const newSecret=()=>[...crypto.getRandomValues(new Uint8Array(24))].map(b=>b.toString(16).padStart(2,'0')).join('');
+function setup(){
+  if(acct)return;
+  let guess='';try{guess=new Intl.Locale(navigator.language).region||''}catch{}
+  $('#setupCountry').innerHTML=opts(guess||'TH');$('#setup').hidden=false;
+}
+function finishSetup(){
+  const c=$('#setupCountry').value;
+  acct={country:c,id:c+'-'+rand6(),secret:newSecret(),reg:false};ls.set('acct',acct);
+  $('#setup').hidden=true;render();ensureRegistered();
+}
+async function ensureRegistered(){
+  if(!acct||acct.reg||!configured())return;
+  for(let i=0;i<6;i++){
+    try{
+      const ok=await rpc('register_device',{p_id:acct.id,p_country:acct.country,p_secret:acct.secret});
+      if(ok){acct.reg=true;ls.set('acct',acct);render();return}
+      acct.id=acct.country+'-'+rand6();ls.set('acct',acct); // ID taken: pick another
+    }catch{return} // offline: retry later
+  }
+}
+window.addEventListener('online',()=>{ensureRegistered();refreshFriends()});
+
+/* ---------- friends ---------- */
+async function addFriend(id){
+  id=id.trim().toUpperCase();
+  if(!acct.reg)return toast('Go online once to finish setting up your ID.');
+  try{await rpc('add_friend',{...A(),p_friend:id});toast('Added '+id);refreshFriends()}catch(e){toast(e.message)}
+}
+function addByCode(){
+  const code=$('#fcode').value.replace(/\D/g,'');
+  if(code.length!==6)return toast('Enter the 6-digit code.');
+  addFriend($('#fcountry').value+'-'+code);
+}
+async function refreshFriends(){
+  if(!acct||!acct.reg||!configured()||!navigator.onLine)return;
+  try{friends=await rpc('list_friends',A());ls.set('friends',friends);if(view!=='home')render()}catch{}
+}
+
+/* ---------- scanning ---------- */
+async function scan(){
+  $('#scan').hidden=false;
+  try{stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'}})}
+  catch{$('#scan').hidden=true;return toast('Allow camera access to scan a QR code.')}
+  const v=$('#vid');v.srcObject=stream;await v.play();scanning=true;
+  const c=document.createElement('canvas'),x=c.getContext('2d',{willReadFrequently:true});
+  (function tick(){
+    if(!scanning)return;
+    if(v.videoWidth){
+      c.width=v.videoWidth;c.height=v.videoHeight;x.drawImage(v,0,0);
+      const r=jsQR(x.getImageData(0,0,c.width,c.height).data,c.width,c.height);
+      if(r&&/^[A-Z]{2}-\d{6}$/.test(r.data)){closeScan();addFriend(r.data);return}
+    }
+    requestAnimationFrame(tick);
+  })();
+}
+function closeScan(){scanning=false;if(stream)stream.getTracks().forEach(t=>t.stop());$('#scan').hidden=true}
+
+/* ---------- recording ---------- */
+const liveTrack=()=>recState&&tracks.find(t=>t.id===recState.id);
+function onPoint(lat,lng,acc,time){
+  const t=liveTrack();if(!t)return;time=time||Date.now();
+  const last=t.pts[t.pts.length-1];
+  if(last&&time-last.t<INTERVAL-10000)return;
+  t.pts.push({lat,lng,acc:acc==null?null:Math.round(acc),t:time});ls.set('tracks',tracks);
+  if(shareOn)pushShare(lat,lng,acc);
+  if(view==='home')render();
+}
+async function startWatch(){
+  if(native){
+    watcher=await BG.addWatcher({backgroundTitle:'Waypal is recording',backgroundMessage:'Saving a location every 5 minutes',requestPermissions:true,stale:false,distanceFilter:0},
+      (loc,err)=>{
+        if(err){if(err.code==='NOT_AUTHORIZED'){toast('Set location access to "All the time".');BG.openSettings()}return}
+        onPoint(loc.latitude,loc.longitude,loc.accuracy,loc.time);
+      });
+  }else{
+    const poll=()=>navigator.geolocation.getCurrentPosition(p=>onPoint(p.coords.latitude,p.coords.longitude,p.coords.accuracy,p.timestamp),()=>toast('Location unavailable.'),{enableHighAccuracy:true,timeout:30000});
+    poll();timer=setInterval(poll,INTERVAL);
+  }
+}
+async function stopWatch(){
+  if(native&&watcher!=null){try{await BG.removeWatcher({id:watcher})}catch{}watcher=null}
+  clearInterval(timer);
+}
+async function toggleRec(){
+  if(recState){await stopWatch();recState=null;ls.set('rec',null);render();return}
+  const t={id:Date.now(),start:Date.now(),pts:[]};tracks.unshift(t);recState={id:t.id};
+  ls.set('tracks',tracks);ls.set('rec',recState);render();
+  if(!native)toast('On the web, keep this tab open and the screen on while recording.');
+  startWatch();
+}
+function delTrack(id){if(recState&&recState.id===id)return toast('Stop recording first.');if(!confirm('Delete this track?'))return;tracks=tracks.filter(t=>t.id!==id);ls.set('tracks',tracks);render()}
+
+/* ---------- export ---------- */
+const gpx=t=>`<?xml version="1.0"?><gpx version="1.1" creator="Waypal" xmlns="http://www.topografix.com/GPX/1/1"><trk><name>${fmt(t.start)}</name><trkseg>`+t.pts.map(p=>`<trkpt lat="${p.lat}" lon="${p.lng}"><time>${new Date(p.t).toISOString()}</time></trkpt>`).join('')+`</trkseg></trk></gpx>`;
+const csv=t=>'time,lat,lng,accuracy_m\n'+t.pts.map(p=>[new Date(p.t).toISOString(),p.lat,p.lng,p.acc??''].join(',')).join('\n');
+async function exportTrack(id,kind){
+  const t=tracks.find(x=>x.id===id);if(!t||!t.pts.length)return toast('This track has no points yet.');
+  const name='track-'+new Date(t.start).toISOString().slice(0,16).replace(/[:T]/g,'-')+'.'+kind;
+  const file=new File([kind==='gpx'?gpx(t):csv(t)],name,{type:kind==='gpx'?'application/gpx+xml':'text/csv'});
+  if(navigator.canShare&&navigator.canShare({files:[file]})){try{await navigator.share({files:[file],title:name});return}catch(e){if(e.name==='AbortError')return}}
+  const a=document.createElement('a');a.href=URL.createObjectURL(file);a.download=name;a.click();
+}
+
+/* ---------- maps link ---------- */
+function mapsLink(t){
+  const p=t.pts;if(!p.length)return null;
+  if(p.length===1)return `https://www.google.com/maps?q=${p[0].lat},${p[0].lng}`;
+  let s=p;
+  if(p.length>25){s=[];for(let i=0;i<25;i++)s.push(p[Math.round(i*(p.length-1)/24)])} // Google Maps accepts about 25 stops
+  return 'https://www.google.com/maps/dir/'+s.map(q=>q.lat.toFixed(6)+','+q.lng.toFixed(6)).join('/');
+}
+function openMap(id){const l=mapsLink(tracks.find(x=>x.id===id)||{pts:[]});if(!l)return toast('This track has no points yet.');window.open(l,'_blank')}
+async function shareMap(id){
+  const l=mapsLink(tracks.find(x=>x.id===id)||{pts:[]});if(!l)return toast('This track has no points yet.');
+  if(navigator.share){try{await navigator.share({title:'My route',url:l});return}catch(e){if(e.name==='AbortError')return}}
+  try{await navigator.clipboard.writeText(l);toast('Link copied.')}catch{prompt('Copy this link:',l)}
+}
+
+/* ---------- live sharing ---------- */
+async function pushShare(lat,lng,acc){
+  if(Date.now()-lastPush<15000||!navigator.onLine||!acct.reg)return;lastPush=Date.now();
+  try{await rpc('share_location',{...A(),p_lat:lat,p_lng:lng,p_acc:acc==null?null:acc})}catch{}
+}
+function startShare(){
+  if(wid!=null)return;
+  wid=navigator.geolocation.watchPosition(p=>pushShare(p.coords.latitude,p.coords.longitude,p.coords.accuracy),()=>toast('Location unavailable.'),{enableHighAccuracy:true});
+}
+async function stopShare(){
+  if(wid!=null){navigator.geolocation.clearWatch(wid);wid=null}
+  try{await rpc('stop_sharing',A())}catch{}
+}
+async function toggleShare(){
+  if(!acct.reg)return toast('Go online once to finish setting up your ID.');
+  shareOn=!shareOn;ls.set('share',shareOn);
+  if(shareOn)startShare();else await stopShare();
+  render();
+}
+
+/* ---------- views ---------- */
+function viewHome(){
+  const on=!!recState,t=liveTrack();
+  const list=tracks.map(t=>`<div class="card"><b>${fmt(t.start)}</b>${recState&&recState.id===t.id?' <span class="mute">(recording)</span>':''}
+    <div class="mute">${t.pts.length} point${t.pts.length===1?'':'s'}${t.pts.length?' · last '+ago(t.pts[t.pts.length-1].t):''}</div>
+    <div class="row" style="margin-top:10px"><button onclick="exportTrack(${t.id},'gpx')">Download GPX</button><button onclick="exportTrack(${t.id},'csv')">Download CSV</button><button class="fit" onclick="delTrack(${t.id})" aria-label="Delete track">Delete</button></div>
+    <div class="row" style="margin-top:8px"><button onclick="openMap(${t.id})">Open in Google Maps</button><button onclick="shareMap(${t.id})">Share map link</button></div></div>`).join('');
+  return `<h1>Home</h1><div class="center">
+    <button class="rec ${on?'on':''}" onclick="toggleRec()">${on?'Stop':'Record'}</button>
+    <div class="mute">${on?`Saving a point every 5 minutes · ${t?t.pts.length:0} saved`:'Tap to save your position every 5 minutes. Works offline.'}</div></div>
+    <h2>Saved tracks</h2>${list||'<p class="mute">No tracks yet. Tap Record to start one.</p>'}`;
+}
+function viewLoc(){
+  const rows=friends.map(f=>`<div class="card row"><div><b>${esc(f.friend)}</b><div class="mute">${f.lat!=null?'Updated '+ago(f.updated_at):'Not sharing'}</div></div>
+    ${f.lat!=null?`<a class="fit" href="https://www.google.com/maps?q=${f.lat},${f.lng}" target="_blank" rel="noopener"><button>Open map</button></a>`:''}</div>`).join('');
+  return `<h1>Location</h1><div class="card"><button class="pri" style="width:100%" onclick="toggleShare()">${shareOn?'Stop sharing location':'Share my location'}</button>
+    <p class="mute" style="margin:10px 0 0"><span class="dot ${shareOn?'on':''}"></span>${shareOn?'Friends can see where you are while the app is open or recording.':'Only friends you have added can see your location.'}</p></div>
+    <h2>Friends</h2>${rows||'<p class="mute">No friends yet. Add one on the Account page.</p>'}`;
+}
+function viewAcct(){
+  let qr='';if(acct){const q=qrcode(0,'M');q.addData(acct.id);q.make();qr=q.createSvgTag({scalable:true,margin:0})}
+  return `<h1>Account</h1><div class="card"><div class="mute center">Your ID</div><div class="id">${esc(acct?acct.id:'')}</div>
+    <div class="qr">${qr}</div>
+    <p class="mute center" style="margin:0">${acct&&acct.reg?'Friends scan this code to add you.':'Go online once to finish setting up.'}</p></div>
+    <h2>Add a friend</h2><div class="card"><button class="pri" style="width:100%" onclick="scan()">Scan their QR code</button>
+    <p class="mute center">or enter their ID</p>
+    <div class="row"><select id="fcountry" aria-label="Friend's country">${opts(acct?acct.country:'TH')}</select>
+    <input id="fcode" inputmode="numeric" maxlength="6" placeholder="6-digit code" aria-label="6-digit code" style="max-width:150px"></div>
+    <button style="width:100%;margin-top:8px" onclick="addByCode()">Add friend</button></div>
+    <h2>Friends (${friends.length})</h2>${friends.map(f=>`<div class="card">${esc(f.friend)}</div>`).join('')||'<p class="mute">No friends yet.</p>'}`;
+}
+function render(){
+  if(!acct)return;
+  const focus=document.activeElement&&document.activeElement.id==='fcode'?$('#fcode').value:null;
+  $('#app').innerHTML=view==='home'?viewHome():view==='loc'?viewLoc():viewAcct();
+  document.querySelectorAll('nav button').forEach(b=>b.setAttribute('aria-current',b.dataset.v===view?'page':'false'));
+  if(focus!==null){const i=$('#fcode');i.value=focus;i.focus()}
+}
+document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
+  view=b.dataset.v;render();clearInterval(poller);
+  if(view!=='home'){refreshFriends();poller=setInterval(refreshFriends,15000)}
+});
+
+/* ---------- start ---------- */
+setup();render();ensureRegistered();refreshFriends();
+if(recState)startWatch();       // resume after the app was closed or the phone rebooted
+if(shareOn&&acct)startShare();
+if(!configured())toast('Add your Supabase URL and key in www/config.js');
+</script>
+</body>
+</html>
